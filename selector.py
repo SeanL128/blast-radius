@@ -32,6 +32,9 @@ WORKER_COST = 2.0
 RUN_OVERHEAD = 0.15  # fixed CPU seconds charged when a commit runs anything
 HEAVY_T = float(os.environ.get("HEAVY_T", "2.0"))  # tests at least this slow are never run
 CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.0"))  # our CPU per recorded test second
+# The run gets 180 s for ~40 commits (270 s for ~60 in the final): ~4.5 s per commit.
+# We plan for SECS_PER_COMMIT and stop running tests (select candidates blind) when it runs out.
+SECS_PER_COMMIT = float(os.environ.get("SECS_PER_COMMIT", "3.0"))
 T0 = time.time()
 
 
@@ -635,7 +638,17 @@ def child_run(commit, edits, run_nums, reimport, tmp):
         def addSubTest(self, test, subtest, err):
             super().addSubTest(test, subtest, err)
             if err is not None:
+                self._check_timeout(err)
                 raise StopTest()  # one failing subtest fails the test: skip the rest
+
+        def addError(self, test, err):
+            super().addError(test, err)
+            self._check_timeout(err)
+
+        def _check_timeout(self, err):
+            if err[0] is TestTimeout:
+                self.timed_out = True  # likely a hang: stop and fail everything rather than burn CPU
+                self.stop()
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -650,6 +663,9 @@ def child_run(commit, edits, run_nums, reimport, tmp):
         suite.run(res)
     except BaseException:
         log(commit, "suite crashed", traceback.format_exc(limit=2))
+        return set(run_nums)
+    if getattr(res, "timed_out", False):
+        log(commit, "test timed out: failing all")
         return set(run_nums)
 
     def to_num(test):
@@ -669,11 +685,12 @@ def child_run(commit, edits, run_nums, reimport, tmp):
     return failing
 
 
-def run_in_child(commit, edits, run_nums, reimport):
+def run_in_child(commit, edits, run_nums, reimport, budget):
     tmp = os.path.join("/tmp", "br", commit)
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
+        os.setpgid(0, 0)  # own group: killing it also kills subprocesses
         os.close(r)
         try:
             failing = child_run(commit, edits, run_nums, reimport, tmp)
@@ -691,13 +708,16 @@ def run_in_child(commit, edits, run_nums, reimport):
             os._exit(0)
     os.close(w)
     chunks = []
-    deadline = time.time() + max(20.0, 3 * sum(SECS[n] for n in run_nums) + 10)
+    deadline = time.time() + min(budget, max(10.0, 3 * sum(SECS[n] for n in run_nums) + 5))
     import select
 
     while True:
         left = deadline - time.time()
         if left <= 0:
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                os.kill(pid, signal.SIGKILL)
             log(commit, "child timed out")
             chunks = None
             break
@@ -796,13 +816,20 @@ def main():
     warm_up()
     log("warm")
     out = []
-    for commit, cand, edits, reimport, notes, groups in jobs:
+    t_end = T0 + SECS_PER_COMMIT * len(jobs) + 5
+    for i, (commit, cand, edits, reimport, notes, groups) in enumerate(jobs):
         cond = conditional_heavies(cand, groups, notes)
         run, blind = plan(cand - set(cond))
         sentinels = set().union(*cond.values()) if cond else set()
         run |= sentinels
         blind -= sentinels
-        failing = run_in_child(commit, edits, sorted(run), reimport) if run else set()
+        # leave 0.5 s for each later commit; out of time -> run nothing, select candidates blind
+        budget = t_end - time.time() - 0.5 * (len(jobs) - i - 1)
+        if run and budget < 1.0:
+            failing = set(run)
+            notes.append("out-of-time")
+        else:
+            failing = run_in_child(commit, edits, sorted(run), reimport, budget) if run else set()
         sel = (failing & run) | blind
         added = {h for h, sn in cond.items() if sn & failing}
         sel |= added
