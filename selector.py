@@ -35,6 +35,7 @@ CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.0"))  # our CPU per recorded 
 # The run gets 180 s for ~40 commits (270 s for ~60 in the final): ~4.5 s per commit.
 # We plan for SECS_PER_COMMIT and stop running tests (select candidates blind) when it runs out.
 SECS_PER_COMMIT = float(os.environ.get("SECS_PER_COMMIT", "3.0"))
+MAX_WALL = float(os.environ.get("MAX_WALL", "145"))
 T0 = time.time()
 
 
@@ -652,6 +653,7 @@ def child_run(commit, edits, run_nums, reimport, tmp):
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
+            self.done.add(id2num.get(test.id()))
             super().stopTest(test)
 
     def on_alarm(*_):
@@ -659,14 +661,16 @@ def child_run(commit, edits, run_nums, reimport, tmp):
 
     signal.signal(signal.SIGALRM, on_alarm)
     res = Result()
+    res.done = set()
     try:
         suite.run(res)
     except BaseException:
         log(commit, "suite crashed", traceback.format_exc(limit=2))
         return set(run_nums)
     if getattr(res, "timed_out", False):
-        log(commit, "test timed out: failing all")
-        return set(run_nums)
+        # the timed-out test is in res.errors; tests never started count as failing
+        log(commit, "test timed out: failing it and the unrun rest")
+        failing |= set(run_nums) - res.done
 
     def to_num(test):
         tc = getattr(test, "test_case", test)  # _SubTest -> its TestCase
@@ -816,20 +820,23 @@ def main():
     warm_up()
     log("warm")
     out = []
-    t_end = T0 + SECS_PER_COMMIT * len(jobs) + 5
+    # ponytail: the commit count is hidden, so cap at 145 s, which fits the 180 s practice limit.
+    # The final (270 s) gets the same cap and only loses runs, never correctness.
+    t_end = T0 + min(SECS_PER_COMMIT * len(jobs) + 5, MAX_WALL)
     for i, (commit, cand, edits, reimport, notes, groups) in enumerate(jobs):
-        cond = conditional_heavies(cand, groups, notes)
-        run, blind = plan(cand - set(cond))
-        sentinels = set().union(*cond.values()) if cond else set()
-        run |= sentinels
-        blind -= sentinels
         # leave 0.5 s for each later commit; out of time -> run nothing, select candidates blind
         budget = t_end - time.time() - 0.5 * (len(jobs) - i - 1)
-        if run and budget < 1.0:
-            failing = set(run)
+        if budget < 1.0:
+            cond, run, blind, failing = {}, set(), set(cand), set()
             notes.append("out-of-time")
         else:
-            failing = run_in_child(commit, edits, sorted(run), reimport, budget) if run else set()
+            cond = conditional_heavies(cand, groups, notes)
+            run, blind = plan(cand - set(cond))
+            sentinels = set().union(*cond.values()) if cond else set()
+            run |= sentinels
+            blind -= sentinels
+            budget = t_end - time.time() - 0.5 * (len(jobs) - i - 1)
+            failing = run_in_child(commit, edits, sorted(run), reimport, max(budget, 1.0)) if run else set()
         sel = (failing & run) | blind
         added = {h for h, sn in cond.items() if sn & failing}
         sel |= added
