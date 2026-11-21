@@ -30,6 +30,7 @@ DATA = os.environ.get("DATA_DIR", "/data")
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER_COST = 2.0
 RUN_OVERHEAD = 0.15  # fixed CPU seconds charged when a commit runs anything
+HEAVY_T = float(os.environ.get("HEAVY_T", "2.0"))  # tests at least this slow are never run
 CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.0"))  # our CPU per recorded test second
 T0 = time.time()
 
@@ -262,33 +263,39 @@ def classes_in(path):
     return s
 
 
-def file_candidates(f, base_src):
-    """-> (candidates, needs_reimport, note) for one file diff."""
+def file_candidates(f, base_src, groups):
+    """-> (candidates, needs_reimport, note) for one file diff.
+
+    Appends to `groups` one set of tests per specific reason (a changed line, a class,
+    a data file). Notes starting with "weak" mean a broad fallback was used."""
     old, new = f["old"], f["new"]
     if f["binary"]:
         p = old or new
         if p and not p.endswith(".py"):
-            return set(OPENS.get(p, ())) | (ALL if p in COLLECT_OPENS else set()), False, "binary"
-        return set(ALL), True, "binary-py"
+            return set(OPENS.get(p, ())) | (ALL if p in COLLECT_OPENS else set()), False, "weak-binary"
+        return set(ALL), True, "weak-binary-py"
     path = old or new
     if old is not None and new is not None and old != new:
         # rename: old module gone, new one appears
         if old.endswith(".py"):
-            return users(old) | classes_in(old) | (ALL if old.startswith(("sqlglot/", "tests/")) else set()), True, "rename"
-        return set(OPENS.get(old, ())), False, "rename-data"
+            return users(old) | classes_in(old) | (ALL if old.startswith(("sqlglot/", "tests/")) else set()), True, "weak-rename"
+        return set(OPENS.get(old, ())), False, "weak-rename-data"
     if not path.endswith(".py"):
         if f["created"] or base_src is None:
             return set(), False, "new-data"
-        return set(OPENS.get(path, ())) | (ALL if path in COLLECT_OPENS else set()), False, "data"
+        if path in COLLECT_OPENS:
+            return set(ALL), True, "weak-collect-data"
+        groups.append(set(OPENS.get(path, ())))
+        return set(groups[-1]), False, "data"
     if f["created"] or base_src is None:
         # a new module only matters if something imports it, which another hunk would show
         return set(), True, "new-py"
     if f["deleted"]:
-        return users(path) | classes_in(path) | (ALL if path.startswith("sqlglot/") else set()), True, "deleted-py"
+        return users(path) | classes_in(path) | (ALL if path.startswith("sqlglot/") else set()), True, "weak-deleted-py"
     try:
         new_src, changed = apply_hunks(base_src, f["hunks"])
     except ValueError:
-        return set(ALL), True, "apply-failed"
+        return set(ALL), True, "weak-apply-failed"
     try:
         if code_tokens(base_src) == code_tokens(new_src):
             return set(), False, "comment-only"
@@ -297,38 +304,46 @@ def file_candidates(f, base_src):
     try:
         ranges, kind = analyze(path, base_src)
     except SyntaxError:
-        return set(ALL), True, "base-unparsable"
-    cand, reimport = set(), False
+        return set(ALL), True, "weak-base-unparsable"
+    cand, reimport, note = set(), False, "py"
     fl = LINES.get(path, {})
     is_test_file = path.startswith("tests/")
     for l in changed:
         k, cls = kind.get(l, ("import", None))
         if k == "doc":
-            cand |= BY_FILE.get("tests/test_docs.py", set())
+            g = set(BY_FILE.get("tests/test_docs.py", set()))
+            groups.append(g)
+            cand |= g
             continue
         if k == "func":
             lines = {l}
             for lo, hi in ranges:
                 if lo <= l <= hi:
                     lines.update(range(lo, hi + 1))
+            g = set()
             for x in lines:
-                cand.update(fl.get(str(x), ()))
+                g.update(fl.get(str(x), ()))
+            groups.append(g)
+            cand |= g
             continue
         reimport = True
         if is_test_file:
             if os.path.basename(path).startswith("test_"):
-                cand |= BY_FILE.get(path, set())
+                g = set(BY_FILE.get(path, set()))
+                groups.append(g)
+                cand |= g
             else:
                 cand |= ALL
+                note = "weak-test-helper"
             continue
         if cls:
             key = f"{mod_name(path)}:{cls}"
-            cand.update(CLASSES.get(key, ()))
-            # attribute reads on the class from code outside an instance still count via line users
-            cand.update(fl.get(str(l), ()))
+            g = set(CLASSES.get(key, ())) | set(fl.get(str(l), ()))
         else:
-            cand |= users(path) | classes_in(path)
-    return cand, reimport, "py"
+            g = users(path) | classes_in(path)
+        groups.append(g)
+        cand |= g
+    return cand, reimport, note
 
 
 # ---------------------------------------------------------------- packing
@@ -351,6 +366,30 @@ def pack(nums):
         if best is None or cost < best[0]:
             best = (cost, w)
     return best
+
+
+def conditional_heavies(cand, groups, notes):
+    """Heavy test -> cheap sentinel tests. A heavy test is skipped when every reason it was
+    picked for is shared by cheap tests that we run, and it is selected if any of them fails.
+    ponytail: sentinel rule is a bet (miss = 300 s vs ~20 s saved); disable with HEAVY_T=1e9."""
+    if any(":weak" in x or x.startswith("weak") for x in notes):
+        return {}
+    out = {}
+    for h in cand:
+        if SECS[h] < HEAVY_T:
+            continue
+        gs = [g for g in groups if h in g]
+        if not gs:
+            continue
+        sn = set()
+        for g in gs:
+            cheap = {n for n in g if SECS[n] < HEAVY_T}
+            if not cheap:
+                break
+            sn |= cheap
+        else:
+            out[h] = sn
+    return out
 
 
 def plan(cand):
@@ -405,6 +444,10 @@ class InlinePool:
 
 
 class TestTimeout(BaseException):
+    pass
+
+
+class StopTest(Exception):
     pass
 
 
@@ -589,6 +632,11 @@ def child_run(commit, edits, run_nums, reimport, tmp):
             limit = max(5.0, 20 * SECS.get(n, 1.0))
             signal.setitimer(signal.ITIMER_REAL, limit)
 
+        def addSubTest(self, test, subtest, err):
+            super().addSubTest(test, subtest, err)
+            if err is not None:
+                raise StopTest()  # one failing subtest fails the test: skip the rest
+
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_REAL, 0)
             super().stopTest(test)
@@ -711,19 +759,19 @@ def main():
             files = parse_patch(text)
         except Exception:
             log(commit, "unparsable patch")
-            jobs.append((commit, set(ALL), {}, True, ["unparsable"]))
+            jobs.append((commit, set(ALL), {}, True, ["weak-unparsable"], []))
             continue
-        cand, edits, reimport, notes = set(), {}, False, []
+        cand, edits, reimport, notes, groups = set(), {}, False, [], []
         if not files:
             notes.append("empty")
         for f in files:
             path = f["old"] or f["new"]
             base_src = read_base(f["old"]) if f["old"] else None
             try:
-                c, ri, note = file_candidates(f, base_src)
+                c, ri, note = file_candidates(f, base_src, groups)
             except Exception:
                 log(commit, "analysis error", path, traceback.format_exc(limit=2))
-                c, ri, note = set(ALL), True, "error"
+                c, ri, note = set(ALL), True, "weak-error"
             cand |= c
             reimport |= ri
             notes.append(f"{path}:{note}:{len(c)}")
@@ -742,17 +790,24 @@ def main():
             except Exception:
                 cand |= ALL
                 reimport = True
-        jobs.append((commit, cand, edits, reimport, notes))
+                notes.append("weak-edit")
+        jobs.append((commit, cand, edits, reimport, notes, groups))
 
     warm_up()
     log("warm")
     out = []
-    for commit, cand, edits, reimport, notes in jobs:
-        run, blind = plan(cand)
+    for commit, cand, edits, reimport, notes, groups in jobs:
+        cond = conditional_heavies(cand, groups, notes)
+        run, blind = plan(cand - set(cond))
+        sentinels = set().union(*cond.values()) if cond else set()
+        run |= sentinels
+        blind -= sentinels
         failing = run_in_child(commit, edits, sorted(run), reimport) if run else set()
         sel = (failing & run) | blind
+        added = {h for h, sn in cond.items() if sn & failing}
+        sel |= added
         cost, workers = pack(sel)
-        log(commit, f"cand={len(cand)} run={len(run)} blind={len(blind)} fail={len(failing)} sel={len(sel)} cost={cost:.1f}", " ".join(notes))
+        log(commit, f"cand={len(cand)} run={len(run)} blind={len(blind)} cond={len(cond)}(+{len(added)}) fail={len(failing)} sel={len(sel)} cost={cost:.1f}", " ".join(notes))
         out.append(json.dumps({"commit": commit, "workers": workers}))
     sys.stdout.write("".join(l + "\n" for l in out))
     sys.stdout.flush()

@@ -2,3 +2,7 @@ kit/
 output.jsonl
 __pycache__/
 *.log
+sqlglot/
+covout/
+work/
+.venv/
